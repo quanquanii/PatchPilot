@@ -34,3 +34,6 @@ htmlcov/
 
 # PatchPilot runtime outputs (generated each run)
 runs/
+
+#项目详解
+项目详解.md

@@ -25,35 +25,40 @@ from tools.tester import PytestResult, run_pytest
 
 @dataclass
 class Report:
-    success: bool
-    baseline_passed: bool
-    final_passed: bool
-    iterations: int
-    max_iters: int
-    pytest_cmd: str
-    patch_source: str
-    file_selection_mode: str | None
-    selected_files: list[str] | None
-    modified_files: list[str] | None
-    failure_category: str | None
-    baseline_log_path: str
-    final_log_path: str
-    warning: str | None
-    history: list[dict]
+    """一次修复任务的结构化结果，用于 JSON/Markdown 报告输出。"""
+
+    success: bool  # 最终是否成功修复（测试通过）
+    baseline_passed: bool # 基线测试是否通过（修复前状态）
+    final_passed: bool # 最终测试结果（修复后状态）
+    iterations: int # 实际执行的修复迭代次数（1 表示仅基线测试，无修复尝试）
+    max_iters: int # 允许的最大修复迭代次数（仅 LLM 模式相关）
+    pytest_cmd: str # 用于测试的 pytest 命令（原样记录以便复现）
+    patch_source: str   # 补丁来源：manual（用户提供）或 llm（模型生成）
+    file_selection_mode: str | None # 相关文件选择模式：manual（用户指定）或 auto（从日志提取），仅 LLM 模式相关
+    selected_files: list[str] | None # 用户选择的相关文件列表（仅 manual 模式相关）
+    modified_files: list[str] | None # 实际修改的文件列表
+    failure_category: str | None # 失败类别
+    baseline_log_path: str # 基线测试日志路径
+    final_log_path: str # 最终测试日志路径
+    warning: str | None # 警告信息（例如基线已通过但仍尝试修复的情况）  
+    history: list[dict] # 每次修复迭代的详细记录，包括选文件、提示词、模型响应、补丁应用、测试结果等
 
 
 def _compute_warning(baseline_passed: bool) -> str | None:
+    # 基线测试已通过时提醒用户：此次修复可能不是必须的。
     if baseline_passed:
         return "baseline tests already passed; patch may be unnecessary"
     return None
 
 
 def _run_id() -> str:
+    # 使用时间戳作为本次运行目录名，便于追踪和排序。
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def _read_repo_files(repo: Path, file_paths: list[str]) -> list[tuple[str, str]]:
-    files: list[tuple[str, str]] = []
+    # 读取候选源码文件，并确保路径不会越过仓库根目录。
+    files: list[tuple[str, str]] = [] 
     for rel_path in file_paths:
         path = (repo / rel_path).resolve()
         if not path.exists():
@@ -65,6 +70,7 @@ def _read_repo_files(repo: Path, file_paths: list[str]) -> list[tuple[str, str]]
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    # 命令行参数定义：支持手动补丁模式与 LLM 修复模式。
     p = argparse.ArgumentParser(description="PatchPilot harness.")
     p.add_argument("--repo", required=True, help="Target repo path")
     p.add_argument(
@@ -103,6 +109,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     args = p.parse_args(argv)
 
+    # 参数组合约束，避免互斥选项或无效配置。
     if bool(args.patch) == bool(args.llm):
         p.error("Exactly one of --patch or --llm is required.")
     if args.patch and args.files:
@@ -130,6 +137,7 @@ def _run_patch_mode(
     baseline_log_path: Path,
     baseline_result: PytestResult,
 ) -> Report:
+    # 手动补丁模式：读取补丁 -> 校验 -> apply -> pytest 验证。
     patch_file = Path(args.patch).expanduser().resolve()
     patch_text = patch_file.read_text(encoding="utf-8", errors="replace")
 
@@ -156,6 +164,7 @@ def _run_patch_mode(
     modified_files: list[str] = extract_modified_files(patch_text) if patch_applied else []
 
     if patch_applied:
+        # 仅在补丁成功应用后执行测试。
         iter_result = run_pytest(repo, args.pytest, args.timeout, iter_pytest_log)
         final_log_path = str(iter_pytest_log)
         pytest_passed = iter_result.passed
@@ -166,6 +175,7 @@ def _run_patch_mode(
 
     failure_category: str | None = None
     if not success:
+        # 优先使用补丁错误，否则根据 pytest 日志进行失败分类。
         fail_text = patch_error or iter_pytest_log.read_text(encoding="utf-8")
         failure_category = classify_failure(fail_text)
 
@@ -211,6 +221,7 @@ def _run_llm_repair_loop(
     baseline_log_path: Path,
     baseline_result: PytestResult,
 ) -> Report:
+    # LLM 迭代修复模式：选文件 -> 组 prompt -> 生成补丁 -> 校验/apply -> pytest。
     file_selection_mode = "manual" if args.files else "auto"
 
     current_feedback = baseline_log_path.read_text(encoding="utf-8")
@@ -246,6 +257,7 @@ def _run_llm_repair_loop(
         if args.files:
             file_paths = list(args.files)
         else:
+            # 自动模式下从当前失败日志提取最相关文件，并落盘留痕。
             retrieved = retrieve_files_from_pytest_log(repo, current_feedback)
             rf_json = run_dir / f"retrieved_files_iter_{iter_n}.json"
             rf_json.write_text(
@@ -271,6 +283,7 @@ def _run_llm_repair_loop(
         else:
             # ── b–d. Prompt → LLM → parse patch ─────────────────────────────
             try:
+                # 将失败上下文与候选源码拼装成修复提示词。
                 file_contents = _read_repo_files(repo, file_paths)
                 prompt = build_repair_prompt(
                     current_feedback,
@@ -286,6 +299,7 @@ def _run_llm_repair_loop(
                 llm_response_path.write_text(response, encoding="utf-8")
                 llm_response_path_str = str(llm_response_path)
 
+                # 从模型响应中抽取 unified diff 补丁文本。
                 patch_text = extract_diff_from_response(response)
                 generated_patch_path.write_text(patch_text, encoding="utf-8")
                 generated_patch_path_str = str(generated_patch_path)
@@ -300,6 +314,7 @@ def _run_llm_repair_loop(
 
         # ── e. Safety validation ──────────────────────────────────────────────
         if patch_text and not llm_error:
+            # 安全检查阶段拒绝危险或不合法补丁。
             ok, err = validate_patch(patch_text)
             if not ok:
                 patch_error = err
@@ -315,6 +330,7 @@ def _run_llm_repair_loop(
                 if not apply_res.ok:
                     patch_error = apply_res.error
                 else:
+                    # 汇总本次运行中所有被修改的文件（去重后保序）。
                     for mf in extract_modified_files(patch_text):
                         if mf not in all_modified_seen:
                             all_modified_files.append(mf)
@@ -333,6 +349,7 @@ def _run_llm_repair_loop(
         # ── Classify failure ──────────────────────────────────────────────────
         failure_category: str | None = None
         if not pytest_passed or patch_error or llm_error:
+            # 分类优先级：LLM 错误 > 补丁错误 > pytest 日志。
             if llm_error:
                 fail_text = llm_error
             elif patch_error:
@@ -362,14 +379,17 @@ def _run_llm_repair_loop(
 
         # ── h/i. Stop or update feedback ─────────────────────────────────────
         if pytest_passed:
+            # 一旦通过立即结束迭代。
             final_passed = True
             success = True
             break
 
         if patch_applied:
+            # 补丁已应用但测试未通过：用新日志继续驱动下一轮修复。
             current_feedback = iter_pytest_log.read_text(encoding="utf-8")
             previous_error = None
         else:
+            # 补丁未应用：记录错误作为下一轮提示。
             previous_error = patch_error or llm_error or "Unknown error"
             if not file_paths:
                 break  # retriever won't improve without new feedback
@@ -398,6 +418,7 @@ def _run_llm_repair_loop(
 
 
 def main(argv: list[str]) -> int:
+    # 主流程：解析参数 -> 跑基线测试 -> 执行对应修复模式 -> 写报告。
     args = parse_args(argv)
 
     repo = Path(args.repo).expanduser().resolve()
@@ -426,6 +447,7 @@ def main(argv: list[str]) -> int:
     write_report(report_path, report_dict)
     write_markdown_report(report_md_path, report_dict)
 
+    # 标准输出仅打印报告路径，便于外部脚本消费。
     sys.stdout.write(
         json.dumps({"report": str(report_path), "report_md": str(report_md_path)}, ensure_ascii=False)
         + "\n"
