@@ -1,25 +1,39 @@
 # PatchPilot
 
-面向 Python/pytest 项目的轻量级 Code Repair Agent。它运行 pytest 获取失败日志，自动或手动选择相关文件，调用 LLM 生成 unified diff patch，经 **policy guard** 校验后应用 patch，再次运行 pytest 验证结果，输出 `report.json` 和 `report.md`。
+面向 Python/pytest 项目的轻量级 AI 工程助手，提供两个独立 workflow：
+
+- **repair**（默认）：运行 pytest 获取失败日志 → 调用 LLM 生成 unified diff patch → 经 **policy guard** 校验 → `git apply` → pytest 验证，输出 `report.json` / `report.md`。
+- **spec-review**（`--spec-review`）：读取 `requirements.md` → 调用 LLM 生成结构化评审 → 输出包含 clarifying questions、risks、acceptance criteria、suggested test cases 的 `report.json` / `report.md`。不修改任何代码，不需要 git repo。
 
 ---
 
 ## 核心能力
 
+**Repair workflow**
 - 自动运行 pytest 获取 baseline 失败日志
 - `--auto-files`：从失败日志中提取相关 `.py` 文件（规则检索）
 - 调用 DeepSeek / OpenAI-compatible API 生成 unified diff patch
-- `--llm-mode mock`：无需 API key 即可运行完整流程（用于 demo 和 CI）
 - **Policy guard**：通过 `policies/policy.yaml` 配置校验规则，拒绝危险 patch
 - `git apply --check` 校验后再应用 patch
 - pytest 再次验证修复结果
 - `--max-iters`：失败时最多多轮重试，每轮携带上一轮错误信息
 - `final_decision` 字段明确输出 `BLOCKED` 或 `NEEDS_HUMAN_REVIEW`，AI patch 始终需要人工审查
-- `runs/<run_id>/` 下保存每轮完整产物，便于复盘
+
+**Spec-review workflow**
+- 读取 `requirements.md`，调用 LLM 进行结构化需求评审
+- 输出 `clarifying_questions`、`functional_scope`、`out_of_scope`、`risks`、`acceptance_criteria`、`suggested_test_cases`
+- 不修改代码，不需要 git repo，不需要 pytest
+- `final_decision` 始终为 `NEEDS_HUMAN_REVIEW`
+
+**共同能力**
+- `--llm-mode mock`：无需 API key 即可运行完整流程（用于 demo 和 CI）
+- `runs/<run_id>/` 下保存每次运行的完整产物，便于复盘
 
 ---
 
 ## 架构流程
+
+### Repair workflow
 
 ```
 baseline pytest
@@ -61,6 +75,26 @@ pytest verify
 
 > **注意**：即使测试通过，`final_decision` 仍为 `NEEDS_HUMAN_REVIEW`。AI 生成的 patch 始终需要人工审查后才能合并。
 
+### Spec-review workflow
+
+```
+read requirements.md
+      │
+      ▼
+build spec-review prompt
+      │
+      ▼
+LLM（openai / mock）
+      │
+      ▼
+parse JSON response      ← 支持 ```json 代码块或直接 JSON
+      │
+      ▼
+write report.json / report.md   → final_decision: NEEDS_HUMAN_REVIEW
+```
+
+spec-review 不产生任何 patch，不调用 `git apply`，不运行 pytest，因此也不需要 policy guard。
+
 ---
 
 ## 安装与配置
@@ -98,7 +132,27 @@ pip install --upgrade certifi
 
 ## 使用方式
 
-### Mock 模式（无需 API key，推荐用于 demo / CI）
+### Spec-review（需求评审）
+
+```bash
+python3 agent.py \
+  --spec-review \
+  --requirements examples/demo_project/requirements.md \
+  --llm-mode mock
+```
+
+不需要 `--repo`，不需要 `--pytest`，不需要 API key（mock 模式）。输出 `runs/<run_id>/report.json`，包含结构化评审内容。
+
+真实 LLM 用法：
+
+```bash
+python3 agent.py \
+  --spec-review \
+  --requirements path/to/requirements.md
+# 默认 --llm-mode openai，需要 DEEPSEEK_API_KEY
+```
+
+### Repair — Mock 模式（无需 API key，推荐用于 demo / CI）
 
 ```bash
 # 初始化 demo 目标仓库（仅首次或重置时需要）
@@ -159,18 +213,33 @@ python3 agent.py \
 
 ### 参数说明
 
+**Spec-review 参数**
+
+| 参数 | 说明 |
+|---|---|
+| `--spec-review` | 启用需求评审模式（与 repair 参数互斥） |
+| `--requirements` | `requirements.md` 路径（`--spec-review` 时必填） |
+
+**Repair 参数**
+
 | 参数 | 说明 |
 |---|---|
 | `--repo` | 目标仓库路径（必须是 git repo） |
 | `--pytest` | pytest 命令字符串 |
 | `--llm` | 使用 LLM 生成 patch（与 `--patch` 二选一） |
-| `--llm-mode` | LLM 后端：`openai`（默认）或 `mock`（无需 API key） |
 | `--patch` | 手动指定 .patch 文件（与 `--llm` 二选一） |
 | `--files` | 手动指定相关文件（与 `--auto-files` 二选一，需配合 `--llm`） |
 | `--auto-files` | 自动从日志提取相关文件（与 `--files` 二选一，需配合 `--llm`） |
 | `--max-iters` | 最大修复轮数，1–5，默认 1 |
 | `--timeout` | 每次 pytest 的超时秒数，默认 600 |
 | `--policy` | policy YAML 路径，默认 `policies/policy.yaml` |
+
+**共用参数**
+
+| 参数 | 说明 |
+|---|---|
+| `--llm-mode` | LLM 后端：`openai`（默认）或 `mock`（无需 API key） |
+| `--runs-dir` | 产物目录，默认 `runs/` |
 
 ---
 
@@ -222,6 +291,7 @@ python3 agent.py \
 
 每次运行在 `runs/<run_id>/` 下生成：
 
+**Repair 产物**
 ```
 baseline_pytest.log
 retrieved_files_iter_<n>.json   （--auto-files 模式）
@@ -231,6 +301,15 @@ generated_patch_iter_<n>.diff   （--llm 模式）
 policy_result_iter_<n>.json     （--llm 模式，每轮 policy 检查结果）
 policy_result.json              （--patch 模式）
 pytest_iter_<n>.log
+report.json
+report.md
+```
+
+**Spec-review 产物**
+```
+input_requirements.md           （输入需求文档副本）
+spec_review_prompt.md           （发送给 LLM 的完整 prompt）
+llm_response.txt                （LLM 原始响应）
 report.json
 report.md
 ```
@@ -263,6 +342,25 @@ report.md
 
 `history` 每个元素包含：`iteration`、`selected_files`、`prompt_path`、`llm_response_path`、`generated_patch_path`、`patch_applied`、`pytest_passed`、`pytest_log_path`、`llm_error`、`patch_error`、`failure_category`、`policy_result_path`。
 
+### Spec-review report.json 字段
+
+| 字段 | 说明 |
+|---|---|
+| `mode` | 固定为 `"spec-review"` |
+| `requirements_path` | 输入需求文档的绝对路径 |
+| `final_decision` | 固定为 `"NEEDS_HUMAN_REVIEW"` |
+| `human_review_required` | 固定为 `true` |
+| `clarifying_questions` | 需要澄清的问题列表 |
+| `functional_scope` | 功能范围列表 |
+| `out_of_scope` | 明确不在范围内的项目 |
+| `non_functional_requirements` | 非功能性需求 |
+| `risks` | 风险列表 |
+| `acceptance_criteria` | 验收标准列表 |
+| `suggested_test_cases` | 建议测试用例列表 |
+| `llm_error` | LLM 调用失败时的错误信息（正常时不存在） |
+| `parse_error` | JSON 解析失败时的错误信息（正常时不存在） |
+| `raw_response` | 解析失败时保留的 LLM 原始响应 |
+
 ### failure_category 取值
 
 | 值 | 含义 |
@@ -289,21 +387,38 @@ report.md
 
 ## Demo 项目
 
-`examples/demo_project/` 是一个独立的演示目标仓库，包含一个故意引入的加法 bug：
+`examples/demo_project/` 包含两个演示场景：
+
+**Repair demo** — 一个故意引入的加法 bug：
 
 ```python
 # calculator.py
 def add(a, b):
-    return a - b  # bug
+    return a - b  # bug: should be a + b
 ```
 
-使用前需要先初始化为独立 git repo（`git apply --check` 要求目标目录是 git repo）：
+repair 演示需要先初始化为独立 git repo（`git apply --check` 要求目标目录是 git repo）：
 
 ```bash
 bash scripts/reset_demo_project.sh
+
+python3 agent.py \
+  --repo examples/demo_project \
+  --pytest "pytest -q" \
+  --llm --llm-mode mock \
+  --files calculator.py
 ```
 
-脚本会重置 `calculator.py` 为 buggy 状态并重新 `git init`，适合反复演示。
+**Spec-review demo** — `requirements.md` 描述 `add(a, b)` 功能需求，故意包含若干 unclear 点（非数字输入行为未定义、精度无规定），供 LLM 提出 clarifying questions 和 risks：
+
+```bash
+python3 agent.py \
+  --spec-review \
+  --requirements examples/demo_project/requirements.md \
+  --llm-mode mock
+```
+
+spec-review 不需要 `reset_demo_project.sh`，可直接运行。
 
 ---
 
@@ -311,16 +426,18 @@ bash scripts/reset_demo_project.sh
 
 ```
 PatchPilot/
-  agent.py                   # 主入口，含多轮 repair loop
+  agent.py                   # 主入口：repair loop + spec-review workflow
   policies/
-    policy.yaml              # 默认 policy 配置
+    policy.yaml              # 默认 policy 配置（repair 专用）
   llm/
-    client.py                # LLMClient（OpenAI-compatible）+ MockLLMClient + create_llm_client()
-    prompt_builder.py        # build_repair_prompt()
+    client.py                # LLMClient + MockLLMClient + create_llm_client()
+                             #   generate_patch() → repair 用
+                             #   generate()       → spec-review 用
+    prompt_builder.py        # build_repair_prompt() + build_spec_review_prompt()
     parser.py                # extract_diff_from_response()
     fake_llm.py              # 独立工具：从文件读取 patch（未接入主流程）
   tools/
-    patch_guard.py           # policy-driven patch 校验
+    patch_guard.py           # policy-driven patch 校验（repair 专用）
     policy_loader.py         # 从 YAML 加载 policy，缺失字段使用默认值
     tester.py                # run_pytest()
     patcher.py               # check_patch() / apply_patch()
@@ -329,14 +446,15 @@ PatchPilot/
     classifier.py            # classify_failure()
   report/
     reporter.py              # write_report() → report.json
-    markdown_reporter.py     # write_markdown_report() → report.md
+    markdown_reporter.py     # write_markdown_report() → repair report.md
   examples/
-    demo_project/            # 演示目标仓库（需先运行 reset 脚本初始化）
-      calculator.py
+    demo_project/            # 演示目标仓库（repair 需先运行 reset 脚本初始化）
+      calculator.py          # 含故意 bug：return a - b
       tests/test_calculator.py
       pytest.ini
+      requirements.md        # spec-review demo 输入
   scripts/
-    reset_demo_project.sh    # 重置 demo_project 到 buggy 初始状态
+    reset_demo_project.sh    # 重置 demo_project 到 buggy 初始状态（repair demo 用）
   runs/                      # 每次运行产物（gitignored）
   .env.example
   requirements.txt
@@ -347,15 +465,16 @@ PatchPilot/
 
 ## 当前限制
 
-- 主要支持 Python/pytest 项目，不支持其他语言或测试框架
-- `--auto-files` 是规则检索，不是向量检索；对复杂项目未必准确
-- 复杂的跨多文件 bug 不保证能成功修复
-- 需要目标项目有可运行的 pytest 测试，且目标目录必须是 git repo
+- **Repair**：主要支持 Python/pytest 项目，不支持其他语言或测试框架
+- **Repair**：`--auto-files` 是规则检索，不是向量检索；对复杂项目未必准确
+- **Repair**：复杂的跨多文件 bug 不保证能成功修复
+- **Repair**：目标目录必须是 git repo（`git apply --check` 依赖）
+- **Spec-review**：输出质量依赖 LLM 能力；mock 模式返回固定内容，仅用于演示
 - 不支持 Web UI，不支持 GitHub PR 自动创建
-- `final_decision` 永远不会自动设为 PASS；AI patch 必须经过人工审查
+- `final_decision` 永远不会自动设为 PASS；所有 AI 输出都需要人工审查
 
 ---
 
 ## 关于这个项目
 
-PatchPilot 的核心思路是 **LLM + 工程验证闭环**：LLM 负责生成 patch，pytest 负责验证结果，policy guard 负责守住安全边界，三者共同构成一个有明确成功/失败判断的工程流程。LLM 不是单纯地输出文字，而是嵌入这个流程中被约束和验证的一个环节。
+PatchPilot 的核心思路是**将 LLM 嵌入有明确成功/失败判断的工程流程中**，而不是让它自由输出文字。repair workflow 中，LLM 生成 patch，pytest 验证结果，policy guard 守住安全边界，三者形成反馈闭环。spec-review workflow 中，LLM 对需求文档做结构化分析，输出可供工程师直接使用的评审意见，而不是自动做决策。两个 workflow 都以 `NEEDS_HUMAN_REVIEW` 结束——AI 是助手，最终判断权在人。
