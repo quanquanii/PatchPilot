@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from llm.client import LLMClient
+from llm.client import LLMClient, create_llm_client
 from llm.parser import extract_diff_from_response
 from llm.prompt_builder import build_repair_prompt
 from report.markdown_reporter import write_markdown_report
@@ -117,6 +117,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     p.add_argument("--patch", help="Path to a .patch file (manual mode)")
     p.add_argument("--llm", action="store_true", help="Use DeepSeek LLM to generate patch")
+    p.add_argument(
+        "--llm-mode",
+        choices=["openai", "mock"],
+        default="openai",
+        help="LLM backend for --llm mode: openai (default, requires API key) or mock (no key needed)",
+    )
     p.add_argument(
         "--files",
         nargs="+",
@@ -358,7 +364,7 @@ def _run_llm_repair_loop(
                 prompt_path.write_text(prompt, encoding="utf-8")
                 prompt_path_str = str(prompt_path)
 
-                client = LLMClient()
+                client = create_llm_client(args.llm_mode)
                 response = client.generate_patch(prompt)
                 llm_response_path.write_text(response, encoding="utf-8")
                 llm_response_path_str = str(llm_response_path)

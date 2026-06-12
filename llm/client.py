@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import textwrap
 
 import certifi
 import requests
@@ -63,3 +64,35 @@ class LLMClient:
             return body["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as e:
             raise RuntimeError(f"Unexpected LLM API response: {body}") from e
+
+
+class MockLLMClient:
+    """Returns a hardcoded patch that fixes examples/demo_project/calculator.py.
+
+    Use with --llm-mode mock for demos and CI runs that have no API key.
+    """
+
+    _RESPONSE = textwrap.dedent("""\
+        Here is the fix for the failing test:
+
+        ```diff
+        diff --git a/calculator.py b/calculator.py
+        index 0000001..0000002 100644
+        --- a/calculator.py
+        +++ b/calculator.py
+        @@ -1,2 +1,2 @@
+         def add(a, b):
+        -    return a - b
+        +    return a + b
+        ```
+        """)
+
+    def generate_patch(self, prompt: str) -> str:  # noqa: ARG002
+        return self._RESPONSE
+
+
+def create_llm_client(mode: str) -> "LLMClient | MockLLMClient":
+    """Factory: return the right LLM client for the given mode string."""
+    if mode == "mock":
+        return MockLLMClient()
+    return LLMClient()  # raises ValueError if API key is missing — intentional
