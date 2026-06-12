@@ -13,7 +13,7 @@ load_dotenv()
 
 from llm.client import LLMClient, create_llm_client
 from llm.parser import extract_diff_from_response
-from llm.prompt_builder import build_repair_prompt
+from llm.prompt_builder import build_repair_prompt, build_spec_review_prompt
 from report.markdown_reporter import write_markdown_report
 from report.reporter import write_report
 from tools.classifier import classify_failure
@@ -109,29 +109,28 @@ def _build_decision(
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PatchPilot harness.")
-    p.add_argument("--repo", required=True, help="Target repo path")
+
+    # ── spec-review mode ──────────────────────────────────────────────────────
+    p.add_argument("--spec-review", action="store_true", help="Run spec review workflow")
+    p.add_argument("--requirements", help="Path to requirements.md (--spec-review mode)")
+
+    # ── repair mode ───────────────────────────────────────────────────────────
+    p.add_argument("--repo", help="Target repo path (repair mode)")
     p.add_argument(
         "--pytest",
-        required=True,
-        help='Pytest command as a single string, e.g. "pytest -q"',
+        help='Pytest command as a single string, e.g. "pytest -q" (repair mode)',
     )
-    p.add_argument("--patch", help="Path to a .patch file (manual mode)")
-    p.add_argument("--llm", action="store_true", help="Use DeepSeek LLM to generate patch")
-    p.add_argument(
-        "--llm-mode",
-        choices=["openai", "mock"],
-        default="openai",
-        help="LLM backend for --llm mode: openai (default, requires API key) or mock (no key needed)",
-    )
+    p.add_argument("--patch", help="Path to a .patch file (manual repair mode)")
+    p.add_argument("--llm", action="store_true", help="Use LLM to generate patch (repair mode)")
     p.add_argument(
         "--files",
         nargs="+",
-        help="Related source files relative to repo root (manual file selection)",
+        help="Related source files relative to repo root (repair --llm mode)",
     )
     p.add_argument(
         "--auto-files",
         action="store_true",
-        help="Auto-extract related files from pytest log (alternative to --files)",
+        help="Auto-extract related files from pytest log (repair --llm mode)",
     )
     p.add_argument(
         "--max-iters",
@@ -145,6 +144,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=600,
         help="Pytest timeout in seconds for each run (default: 600)",
     )
+
+    # ── shared ────────────────────────────────────────────────────────────────
+    p.add_argument(
+        "--llm-mode",
+        choices=["openai", "mock"],
+        default="openai",
+        help="LLM backend: openai (default, requires API key) or mock (no key needed)",
+    )
     p.add_argument(
         "--runs-dir",
         default="runs",
@@ -155,8 +162,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=None,
         help="Path to policy YAML file (default: policies/policy.yaml)",
     )
+
     args = p.parse_args(argv)
 
+    # ── spec-review validation ────────────────────────────────────────────────
+    if args.spec_review:
+        if not args.requirements:
+            p.error("--spec-review requires --requirements")
+        return args
+
+    # ── repair mode validation ────────────────────────────────────────────────
+    if not args.repo:
+        p.error("--repo is required in repair mode (or use --spec-review)")
+    if not args.pytest:
+        p.error("--pytest is required in repair mode (or use --spec-review)")
     if bool(args.patch) == bool(args.llm):
         p.error("Exactly one of --patch or --llm is required.")
     if args.patch and args.files:
@@ -511,14 +530,137 @@ def _run_llm_repair_loop(
     )
 
 
+def _parse_spec_review_response(response: str) -> tuple[dict, str | None]:
+    """Extract JSON from LLM response. Returns (result_dict, error_or_None)."""
+    import re as _re
+
+    # 1. Direct JSON parse
+    try:
+        return json.loads(response.strip()), None
+    except json.JSONDecodeError:
+        pass
+
+    # 2. ```json ... ``` block
+    m = _re.search(r"```json\s*\n(.*?)\n\s*```", response, _re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1).strip()), None
+        except json.JSONDecodeError:
+            pass
+
+    # 3. Generic ``` ... ``` block
+    m = _re.search(r"```\s*\n(.*?)\n\s*```", response, _re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1).strip()), None
+        except json.JSONDecodeError:
+            pass
+
+    return {
+        "final_decision": "NEEDS_HUMAN_REVIEW",
+        "human_review_required": True,
+    }, "Failed to parse LLM response as JSON"
+
+
+def _list_section(lines: list[str], title: str, items: list | None) -> None:
+    lines.append(f"\n## {title}\n")
+    if items:
+        for item in items:
+            lines.append(f"- {item}")
+    else:
+        lines.append("_None_")
+
+
+def _write_spec_review_md(path: Path, report: dict) -> None:
+    lines: list[str] = []
+    lines.append("# PatchPilot Spec Review\n")
+    lines.append(f"**Requirements:** `{report.get('requirements_path', '')}`")
+    lines.append(f"**Final decision:** `{report.get('final_decision', 'n/a')}`")
+    lines.append(f"**Human review required:** {'Yes' if report.get('human_review_required') else 'No'}")
+    if report.get("llm_error"):
+        lines.append(f"\n**LLM error:** {report['llm_error']}")
+    if report.get("parse_error"):
+        lines.append(f"\n**Parse error:** {report['parse_error']}")
+    _list_section(lines, "Clarifying Questions", report.get("clarifying_questions"))
+    _list_section(lines, "Functional Scope", report.get("functional_scope"))
+    _list_section(lines, "Out of Scope", report.get("out_of_scope"))
+    _list_section(lines, "Non-Functional Requirements", report.get("non_functional_requirements"))
+    _list_section(lines, "Risks", report.get("risks"))
+    _list_section(lines, "Acceptance Criteria", report.get("acceptance_criteria"))
+    _list_section(lines, "Suggested Test Cases", report.get("suggested_test_cases"))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _run_spec_review(args: argparse.Namespace, run_dir: Path) -> int:
+    """Spec-review workflow: read requirements -> LLM -> JSON report."""
+    req_path = Path(args.requirements).expanduser().resolve()
+    if not req_path.exists():
+        sys.stderr.write(f"Requirements file not found: {req_path}\n")
+        return 1
+
+    req_text = req_path.read_text(encoding="utf-8")
+    (run_dir / "input_requirements.md").write_text(req_text, encoding="utf-8")
+
+    prompt = build_spec_review_prompt(req_text)
+    (run_dir / "spec_review_prompt.md").write_text(prompt, encoding="utf-8")
+
+    llm_error: str | None = None
+    response: str = ""
+    try:
+        client = create_llm_client(args.llm_mode)
+        response = client.generate(prompt)
+        (run_dir / "llm_response.txt").write_text(response, encoding="utf-8")
+    except Exception as e:
+        llm_error = f"{type(e).__name__}: {e}"
+
+    result: dict = {}
+    parse_error: str | None = None
+    if not llm_error:
+        result, parse_error = _parse_spec_review_response(response)
+
+    report: dict = {
+        "mode": "spec-review",
+        "requirements_path": str(req_path),
+        "final_decision": result.get("final_decision", "NEEDS_HUMAN_REVIEW"),
+        "human_review_required": result.get("human_review_required", True),
+        "clarifying_questions": result.get("clarifying_questions", []),
+        "functional_scope": result.get("functional_scope", []),
+        "out_of_scope": result.get("out_of_scope", []),
+        "non_functional_requirements": result.get("non_functional_requirements", []),
+        "risks": result.get("risks", []),
+        "acceptance_criteria": result.get("acceptance_criteria", []),
+        "suggested_test_cases": result.get("suggested_test_cases", []),
+    }
+    if llm_error:
+        report["llm_error"] = llm_error
+    if parse_error:
+        report["parse_error"] = parse_error
+        report["raw_response"] = response
+
+    report_path = run_dir / "report.json"
+    report_md_path = run_dir / "report.md"
+    write_report(report_path, report)
+    _write_spec_review_md(report_md_path, report)
+
+    sys.stdout.write(
+        json.dumps({"report": str(report_path), "report_md": str(report_md_path)}, ensure_ascii=False)
+        + "\n"
+    )
+    return 0
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
 
-    repo = Path(args.repo).expanduser().resolve()
     runs_dir = Path(args.runs_dir).expanduser().resolve()
-
     run_dir = runs_dir / _run_id()
     run_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.spec_review:
+        return _run_spec_review(args, run_dir)
+
+    # ── repair mode ───────────────────────────────────────────────────────────
+    repo = Path(args.repo).expanduser().resolve()
 
     baseline_log_path = run_dir / "baseline_pytest.log"
     report_path = run_dir / "report.json"

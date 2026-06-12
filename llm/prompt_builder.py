@@ -1,6 +1,37 @@
 from __future__ import annotations
 
 
+def build_spec_review_prompt(requirements_text: str) -> str:
+    """Build a prompt that asks the LLM to review a requirements document as JSON."""
+    return f"""## SPEC-REVIEW
+
+You are a senior software engineer reviewing a requirements document before implementation begins.
+Analyse the requirements and return your review as a single JSON object.
+
+## Requirements Document
+
+{requirements_text.strip()}
+
+## Output Format
+
+Return ONLY a JSON object wrapped in a ```json code block with exactly these fields:
+
+```json
+{{
+  "clarifying_questions": ["question 1", "question 2"],
+  "functional_scope": ["item 1", "item 2"],
+  "out_of_scope": ["item 1", "item 2"],
+  "non_functional_requirements": ["item 1"],
+  "risks": ["risk 1", "risk 2"],
+  "acceptance_criteria": ["criterion 1", "criterion 2"],
+  "suggested_test_cases": ["test case 1", "test case 2"],
+  "human_review_required": true,
+  "final_decision": "NEEDS_HUMAN_REVIEW"
+}}
+```
+"""
+
+
 def _guess_lang(rel_path: str) -> str:
     if rel_path.endswith(".py"):
         return "python"
