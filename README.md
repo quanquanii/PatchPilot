@@ -1,9 +1,10 @@
 # PatchPilot
 
-面向 Python/pytest 项目的轻量级 AI 工程助手，提供两个独立 workflow：
+面向 Python/pytest 项目的轻量级 AI 工程助手，提供三个独立 workflow：
 
 - **repair**（默认）：运行 pytest 获取失败日志 → 调用 LLM 生成 unified diff patch → 经 **policy guard** 校验 → `git apply` → pytest 验证，输出 `report.json` / `report.md`。
-- **spec-review**（`--spec-review`）：读取 `requirements.md` → 调用 LLM 生成结构化评审 → 输出包含 clarifying questions、risks、acceptance criteria、suggested test cases 的 `report.json` / `report.md`。不修改任何代码，不需要 git repo。
+- **spec-review**（`--spec-review`）：读取 `requirements.md` → 调用 LLM 生成结构化需求评审 → 输出 clarifying questions、risks、acceptance criteria 等，`report.json` / `report.md`。不修改代码，不需要 git repo。
+- **design-review**（`--design-review`）：读取 `requirements.md` + `design.md` → 调用 LLM 对设计方案做交叉评审 → 输出 requirement coverage、design risks、edge cases、security risks、test strategy 等，`report.json` / `report.md`。不修改代码，不需要 git repo。
 
 ---
 
@@ -22,6 +23,12 @@
 **Spec-review workflow**
 - 读取 `requirements.md`，调用 LLM 进行结构化需求评审
 - 输出 `clarifying_questions`、`functional_scope`、`out_of_scope`、`risks`、`acceptance_criteria`、`suggested_test_cases`
+- 不修改代码，不需要 git repo，不需要 pytest
+- `final_decision` 始终为 `NEEDS_HUMAN_REVIEW`
+
+**Design-review workflow**
+- 读取 `requirements.md` 和 `design.md`，调用 LLM 对设计方案做交叉评审
+- 输出 `requirement_coverage`、`missing_requirements`、`design_risks`、`edge_cases`、`security_risks`、`test_strategy`、`interfaces_and_boundaries`
 - 不修改代码，不需要 git repo，不需要 pytest
 - `final_decision` 始终为 `NEEDS_HUMAN_REVIEW`
 
@@ -95,6 +102,26 @@ write report.json / report.md   → final_decision: NEEDS_HUMAN_REVIEW
 
 spec-review 不产生任何 patch，不调用 `git apply`，不运行 pytest，因此也不需要 policy guard。
 
+### Design-review workflow
+
+```
+read requirements.md + design.md
+      │
+      ▼
+build design-review prompt   ← 包含需求文档 + 设计文档
+      │
+      ▼
+LLM（openai / mock）
+      │
+      ▼
+parse JSON response           ← 支持 ```json 代码块或直接 JSON
+      │
+      ▼
+write report.json / report.md → final_decision: NEEDS_HUMAN_REVIEW
+```
+
+design-review 同样不产生 patch，不调用 `git apply`，不运行 pytest，不需要 policy guard。与 spec-review 的区别在于：它同时读取需求和设计两份文档，评审重点是**设计方案是否充分覆盖需求**，以及设计层面的风险和遗漏。
+
 ---
 
 ## 安装与配置
@@ -149,6 +176,28 @@ python3 agent.py \
 python3 agent.py \
   --spec-review \
   --requirements path/to/requirements.md
+# 默认 --llm-mode openai，需要 DEEPSEEK_API_KEY
+```
+
+### Design-review（设计评审）
+
+```bash
+python3 agent.py \
+  --design-review \
+  --requirements examples/demo_project/requirements.md \
+  --design examples/demo_project/design.md \
+  --llm-mode mock
+```
+
+同时提供需求文档和设计文档，LLM 评审设计方案对需求的覆盖情况、潜在风险和遗漏点。不需要 `--repo`，不需要 `--pytest`，不需要 API key（mock 模式）。
+
+真实 LLM 用法：
+
+```bash
+python3 agent.py \
+  --design-review \
+  --requirements path/to/requirements.md \
+  --design path/to/design.md
 # 默认 --llm-mode openai，需要 DEEPSEEK_API_KEY
 ```
 
@@ -213,12 +262,14 @@ python3 agent.py \
 
 ### 参数说明
 
-**Spec-review 参数**
+**Review 参数（spec-review / design-review 共用）**
 
 | 参数 | 说明 |
 |---|---|
-| `--spec-review` | 启用需求评审模式（与 repair 参数互斥） |
-| `--requirements` | `requirements.md` 路径（`--spec-review` 时必填） |
+| `--spec-review` | 启用需求评审模式（与 `--design-review` / repair 参数互斥） |
+| `--design-review` | 启用设计评审模式（与 `--spec-review` / repair 参数互斥） |
+| `--requirements` | `requirements.md` 路径（`--spec-review` 和 `--design-review` 时必填） |
+| `--design` | `design.md` 路径（`--design-review` 时必填） |
 
 **Repair 参数**
 
@@ -314,6 +365,16 @@ report.json
 report.md
 ```
 
+**Design-review 产物**
+```
+input_requirements.md           （输入需求文档副本）
+input_design.md                 （输入设计文档副本）
+design_review_prompt.md         （发送给 LLM 的完整 prompt）
+llm_response.txt                （LLM 原始响应）
+report.json
+report.md
+```
+
 ### report.json 字段
 
 | 字段 | 说明 |
@@ -357,6 +418,26 @@ report.md
 | `risks` | 风险列表 |
 | `acceptance_criteria` | 验收标准列表 |
 | `suggested_test_cases` | 建议测试用例列表 |
+| `llm_error` | LLM 调用失败时的错误信息（正常时不存在） |
+| `parse_error` | JSON 解析失败时的错误信息（正常时不存在） |
+| `raw_response` | 解析失败时保留的 LLM 原始响应 |
+
+### Design-review report.json 字段
+
+| 字段 | 说明 |
+|---|---|
+| `mode` | 固定为 `"design-review"` |
+| `requirements_path` | 输入需求文档的绝对路径 |
+| `design_path` | 输入设计文档的绝对路径 |
+| `final_decision` | 固定为 `"NEEDS_HUMAN_REVIEW"` |
+| `human_review_required` | 固定为 `true` |
+| `requirement_coverage` | 设计对各需求的覆盖情况 |
+| `missing_requirements` | 设计未覆盖的需求点 |
+| `design_risks` | 设计层面的风险列表 |
+| `edge_cases` | 边界情况和异常输入 |
+| `security_risks` | 安全风险列表 |
+| `test_strategy` | 建议的测试策略 |
+| `interfaces_and_boundaries` | 接口与模块边界观察 |
 | `llm_error` | LLM 调用失败时的错误信息（正常时不存在） |
 | `parse_error` | JSON 解析失败时的错误信息（正常时不存在） |
 | `raw_response` | 解析失败时保留的 LLM 原始响应 |
@@ -420,20 +501,34 @@ python3 agent.py \
 
 spec-review 不需要 `reset_demo_project.sh`，可直接运行。
 
+**Design-review demo** — `design.md` 描述 `add(a, b)` 的实现方案，故意包含若干评审点（无类型校验、模块边界不清晰、测试覆盖不足），与 `requirements.md` 一起送入 LLM 做交叉评审：
+
+```bash
+python3 agent.py \
+  --design-review \
+  --requirements examples/demo_project/requirements.md \
+  --design examples/demo_project/design.md \
+  --llm-mode mock
+```
+
+design-review 同样不需要 `reset_demo_project.sh`，可直接运行。
+
 ---
 
 ## 目录结构
 
 ```
 PatchPilot/
-  agent.py                   # 主入口：repair loop + spec-review workflow
+  agent.py                   # 主入口：repair + spec-review + design-review
   policies/
     policy.yaml              # 默认 policy 配置（repair 专用）
   llm/
     client.py                # LLMClient + MockLLMClient + create_llm_client()
                              #   generate_patch() → repair 用
-                             #   generate()       → spec-review 用
-    prompt_builder.py        # build_repair_prompt() + build_spec_review_prompt()
+                             #   generate()       → spec-review / design-review 用
+    prompt_builder.py        # build_repair_prompt()
+                             # build_spec_review_prompt()
+                             # build_design_review_prompt()
     parser.py                # extract_diff_from_response()
     fake_llm.py              # 独立工具：从文件读取 patch（未接入主流程）
   tools/
@@ -452,7 +547,8 @@ PatchPilot/
       calculator.py          # 含故意 bug：return a - b
       tests/test_calculator.py
       pytest.ini
-      requirements.md        # spec-review demo 输入
+      requirements.md        # spec-review / design-review demo 输入
+      design.md              # design-review demo 输入
   scripts/
     reset_demo_project.sh    # 重置 demo_project 到 buggy 初始状态（repair demo 用）
   runs/                      # 每次运行产物（gitignored）
@@ -469,7 +565,7 @@ PatchPilot/
 - **Repair**：`--auto-files` 是规则检索，不是向量检索；对复杂项目未必准确
 - **Repair**：复杂的跨多文件 bug 不保证能成功修复
 - **Repair**：目标目录必须是 git repo（`git apply --check` 依赖）
-- **Spec-review**：输出质量依赖 LLM 能力；mock 模式返回固定内容，仅用于演示
+- **Spec-review / Design-review**：输出质量依赖 LLM 能力；mock 模式返回固定内容，仅用于演示
 - 不支持 Web UI，不支持 GitHub PR 自动创建
 - `final_decision` 永远不会自动设为 PASS；所有 AI 输出都需要人工审查
 
@@ -477,4 +573,4 @@ PatchPilot/
 
 ## 关于这个项目
 
-PatchPilot 的核心思路是**将 LLM 嵌入有明确成功/失败判断的工程流程中**，而不是让它自由输出文字。repair workflow 中，LLM 生成 patch，pytest 验证结果，policy guard 守住安全边界，三者形成反馈闭环。spec-review workflow 中，LLM 对需求文档做结构化分析，输出可供工程师直接使用的评审意见，而不是自动做决策。两个 workflow 都以 `NEEDS_HUMAN_REVIEW` 结束——AI 是助手，最终判断权在人。
+PatchPilot 的核心思路是**将 LLM 嵌入有明确成功/失败判断的工程流程中**，而不是让它自由输出文字。repair workflow 中，LLM 生成 patch，pytest 验证结果，policy guard 守住安全边界，三者形成反馈闭环。spec-review workflow 中，LLM 对需求文档做结构化分析，输出可供工程师直接使用的评审意见。design-review workflow 中，LLM 同时读取需求和设计两份文档，检查设计对需求的覆盖情况，识别风险与遗漏。三个 workflow 都以 `NEEDS_HUMAN_REVIEW` 结束——AI 是助手，最终判断权在人。
