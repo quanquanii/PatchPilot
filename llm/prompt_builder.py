@@ -67,6 +67,39 @@ Return ONLY a JSON object wrapped in a ```json code block with exactly these fie
 """
 
 
+def build_diff_review_prompt(diff_text: str) -> str:
+    """Build a prompt that asks the LLM to review a unified diff as JSON."""
+    return f"""## REVIEW-DIFF
+
+You are a senior software engineer reviewing a code change (unified diff) before it is merged.
+Analyse the diff and return your review as a single JSON object.
+
+## Diff
+
+```diff
+{diff_text.strip()}
+```
+
+## Output Format
+
+Return ONLY a JSON object wrapped in a ```json code block with exactly these fields:
+
+```json
+{{
+  "summary": ["one-line description of what the change does"],
+  "bug_risks": ["potential bug introduced or risk exposed by this change"],
+  "security_risks": ["security concern 1"],
+  "maintainability_findings": ["readability or maintainability observation"],
+  "test_coverage_gaps": ["test that is missing or should be added"],
+  "suggested_followups": ["follow-up task or improvement to consider"],
+  "blocking_findings": ["critical issue that must be fixed before merging"],
+  "human_review_required": true,
+  "final_decision": "NEEDS_HUMAN_REVIEW"
+}}
+```
+"""
+
+
 def _guess_lang(rel_path: str) -> str:
     if rel_path.endswith(".py"):
         return "python"

@@ -134,6 +134,41 @@ class MockLLMClient:
         ```
         """)
 
+    _REVIEW_DIFF_RESPONSE = textwrap.dedent("""\
+        ```json
+        {
+          "summary": [
+            "Fix add(a, b): replace subtraction with addition — single-line change in a 2-line function"
+          ],
+          "bug_risks": [
+            "The original 'return a - b' was incorrect for an add() function; this change corrects it",
+            "Any caller relying on subtraction behavior would itself be buggy — no regression risk expected"
+          ],
+          "security_risks": [
+            "No security implications — pure arithmetic with no I/O or external calls"
+          ],
+          "maintainability_findings": [
+            "Function has no docstring or type hints; adding them would make the contract explicit",
+            "No input validation — behavior for non-numeric inputs remains undefined after this change"
+          ],
+          "test_coverage_gaps": [
+            "No float test: add(1.5, 2.5) == 4.0",
+            "No zero test: add(0, 0) == 0",
+            "No negative number test: add(-1, 1) == 0",
+            "No test for non-numeric inputs to document expected error behavior"
+          ],
+          "suggested_followups": [
+            "Add type hints: def add(a: float, b: float) -> float",
+            "Add a one-line docstring describing the function contract",
+            "Expand test suite to cover floats, zero, negative inputs, and edge cases"
+          ],
+          "blocking_findings": [],
+          "human_review_required": true,
+          "final_decision": "NEEDS_HUMAN_REVIEW"
+        }
+        ```
+        """)
+
     _DESIGN_REVIEW_RESPONSE = textwrap.dedent("""\
         ```json
         {
@@ -179,6 +214,8 @@ class MockLLMClient:
         """)
 
     def generate(self, prompt: str) -> str:
+        if "REVIEW-DIFF" in prompt:
+            return self._REVIEW_DIFF_RESPONSE
         if "DESIGN-REVIEW" in prompt:
             return self._DESIGN_REVIEW_RESPONSE
         if "SPEC-REVIEW" in prompt:
