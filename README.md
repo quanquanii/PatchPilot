@@ -1,10 +1,11 @@
 # PatchPilot
 
-面向 Python/pytest 项目的轻量级 AI 工程助手，提供三个独立 workflow：
+面向 Python/pytest 项目的轻量级 AI 工程助手，提供四个独立 workflow：
 
 - **repair**（默认）：运行 pytest 获取失败日志 → 调用 LLM 生成 unified diff patch → 经 **policy guard** 校验 → `git apply` → pytest 验证，输出 `report.json` / `report.md`。
 - **spec-review**（`--spec-review`）：读取 `requirements.md` → 调用 LLM 生成结构化需求评审 → 输出 clarifying questions、risks、acceptance criteria 等，`report.json` / `report.md`。不修改代码，不需要 git repo。
 - **design-review**（`--design-review`）：读取 `requirements.md` + `design.md` → 调用 LLM 对设计方案做交叉评审 → 输出 requirement coverage、design risks、edge cases、security risks、test strategy 等，`report.json` / `report.md`。不修改代码，不需要 git repo。
+- **review-diff**（`--review-diff`）：读取 `.diff` / `.patch` 文件 → 调用 LLM 做代码变更评审 → 输出 summary、bug risks、security risks、maintainability findings、test coverage gaps 等，`report.json` / `report.md`。不修改代码，不 apply patch，不需要 git repo。
 
 ---
 
@@ -31,6 +32,12 @@
 - 输出 `requirement_coverage`、`missing_requirements`、`design_risks`、`edge_cases`、`security_risks`、`test_strategy`、`interfaces_and_boundaries`
 - 不修改代码，不需要 git repo，不需要 pytest
 - `final_decision` 始终为 `NEEDS_HUMAN_REVIEW`
+
+**Review-diff workflow**
+- 读取 `.diff` / `.patch` 文件，调用 LLM 进行代码变更评审
+- 输出 `summary`、`bug_risks`、`security_risks`、`maintainability_findings`、`test_coverage_gaps`、`suggested_followups`、`blocking_findings`
+- 不修改代码，不执行 `git apply`，不运行 pytest，不需要 git repo
+- `final_decision` 始终为 `NEEDS_HUMAN_REVIEW`，`human_review_required` 始终为 `true`
 
 **共同能力**
 - `--llm-mode mock`：无需 API key 即可运行完整流程（用于 demo 和 CI）
@@ -122,6 +129,26 @@ write report.json / report.md → final_decision: NEEDS_HUMAN_REVIEW
 
 design-review 同样不产生 patch，不调用 `git apply`，不运行 pytest，不需要 policy guard。与 spec-review 的区别在于：它同时读取需求和设计两份文档，评审重点是**设计方案是否充分覆盖需求**，以及设计层面的风险和遗漏。
 
+### Review-diff workflow
+
+```
+read .diff / .patch file
+      │
+      ▼
+build diff-review prompt     ← 包含完整 diff 内容
+      │
+      ▼
+LLM（openai / mock）
+      │
+      ▼
+parse JSON response           ← 支持 ```json 代码块或直接 JSON
+      │
+      ▼
+write report.json / report.md → final_decision: NEEDS_HUMAN_REVIEW
+```
+
+review-diff 不产生任何新 patch，不执行 `git apply`，不运行 pytest，不需要 policy guard。它的输入是**已有的 diff 文件**，评审重点是变更本身的质量：bug 风险、安全风险、可维护性、测试覆盖缺口和潜在的阻塞性问题。
+
 ---
 
 ## 安装与配置
@@ -201,6 +228,26 @@ python3 agent.py \
 # 默认 --llm-mode openai，需要 DEEPSEEK_API_KEY
 ```
 
+### Review-diff（代码变更评审）
+
+```bash
+python3 agent.py \
+  --review-diff \
+  --diff examples/demo_project/sample.diff \
+  --llm-mode mock
+```
+
+提供一个 `.diff` 或 `.patch` 文件，LLM 对变更内容做结构化评审。不需要 `--repo`，不需要 `--pytest`，不需要 API key（mock 模式）。patch 文件不会被 apply 到任何 repo。
+
+真实 LLM 用法：
+
+```bash
+python3 agent.py \
+  --review-diff \
+  --diff path/to/my_change.diff
+# 默认 --llm-mode openai，需要 DEEPSEEK_API_KEY
+```
+
 ### Repair — Mock 模式（无需 API key，推荐用于 demo / CI）
 
 ```bash
@@ -262,14 +309,16 @@ python3 agent.py \
 
 ### 参数说明
 
-**Review 参数（spec-review / design-review 共用）**
+**Review 参数（spec-review / design-review / review-diff）**
 
 | 参数 | 说明 |
 |---|---|
-| `--spec-review` | 启用需求评审模式（与 `--design-review` / repair 参数互斥） |
-| `--design-review` | 启用设计评审模式（与 `--spec-review` / repair 参数互斥） |
+| `--spec-review` | 启用需求评审模式（三个 review 模式互斥） |
+| `--design-review` | 启用设计评审模式（三个 review 模式互斥） |
+| `--review-diff` | 启用代码变更评审模式（三个 review 模式互斥） |
 | `--requirements` | `requirements.md` 路径（`--spec-review` 和 `--design-review` 时必填） |
 | `--design` | `design.md` 路径（`--design-review` 时必填） |
+| `--diff` | `.diff` / `.patch` 文件路径（`--review-diff` 时必填） |
 
 **Repair 参数**
 
@@ -310,6 +359,19 @@ python3 agent.py \
 | `allow_test_modification` | `false` | 是否允许修改测试文件 |
 | `require_tests` | `true` | 保留字段，后续版本使用 |
 | `require_git_apply_check` | `true` | 是否执行 `git apply --check` 作为 policy 一部分 |
+
+### Repair vs Review workflows
+
+| | Repair | Spec-review / Design-review / Review-diff |
+|---|---|---|
+| 修改代码 | 是（`git apply`） | **否** |
+| 需要 git repo | 是 | **否** |
+| 运行 pytest | 是 | **否** |
+| Policy guard | 是（`policy.yaml` + `patch_guard.py` + `git apply --check`） | **否** |
+| 输出约束 | structured JSON report + policy checks + pytest verify | structured JSON report + checklist + human review |
+| `final_decision` | `BLOCKED` 或 `NEEDS_HUMAN_REVIEW` | 始终 `NEEDS_HUMAN_REVIEW` |
+
+review workflows（spec-review、design-review、review-diff）都是**只读分析**：它们不产生可执行的 patch，不写入任何 repo，因此 policy guard 的所有门控对它们没有意义。
 
 ### 检查项
 
@@ -370,6 +432,15 @@ report.md
 input_requirements.md           （输入需求文档副本）
 input_design.md                 （输入设计文档副本）
 design_review_prompt.md         （发送给 LLM 的完整 prompt）
+llm_response.txt                （LLM 原始响应）
+report.json
+report.md
+```
+
+**Review-diff 产物**
+```
+input_diff.patch                （输入 diff 文件副本）
+diff_review_prompt.md           （发送给 LLM 的完整 prompt）
 llm_response.txt                （LLM 原始响应）
 report.json
 report.md
@@ -438,6 +509,25 @@ report.md
 | `security_risks` | 安全风险列表 |
 | `test_strategy` | 建议的测试策略 |
 | `interfaces_and_boundaries` | 接口与模块边界观察 |
+| `llm_error` | LLM 调用失败时的错误信息（正常时不存在） |
+| `parse_error` | JSON 解析失败时的错误信息（正常时不存在） |
+| `raw_response` | 解析失败时保留的 LLM 原始响应 |
+
+### Review-diff report.json 字段
+
+| 字段 | 说明 |
+|---|---|
+| `mode` | 固定为 `"review-diff"` |
+| `diff_path` | 输入 diff 文件的绝对路径 |
+| `final_decision` | 固定为 `"NEEDS_HUMAN_REVIEW"` |
+| `human_review_required` | 固定为 `true` |
+| `summary` | 变更内容的一句话描述列表 |
+| `bug_risks` | 变更引入或暴露的 bug 风险 |
+| `security_risks` | 安全风险列表 |
+| `maintainability_findings` | 可读性或可维护性观察 |
+| `test_coverage_gaps` | 缺失或应补充的测试列表 |
+| `suggested_followups` | 后续可改进的任务或建议 |
+| `blocking_findings` | 合并前必须修复的阻塞性问题（空列表表示无阻塞项） |
 | `llm_error` | LLM 调用失败时的错误信息（正常时不存在） |
 | `parse_error` | JSON 解析失败时的错误信息（正常时不存在） |
 | `raw_response` | 解析失败时保留的 LLM 原始响应 |
@@ -513,22 +603,46 @@ python3 agent.py \
 
 design-review 同样不需要 `reset_demo_project.sh`，可直接运行。
 
+**Review-diff demo** — `sample.diff` 是将 `calculator.py` 从错误实现（`return a - b`）改成正确实现（`return a + b`）的最小 unified diff，用于演示 review-diff 对变更内容的结构化评审：
+
+```bash
+python3 agent.py \
+  --review-diff \
+  --diff examples/demo_project/sample.diff \
+  --llm-mode mock
+```
+
+review-diff 不会修改任何文件，不需要 `reset_demo_project.sh`，可直接运行。
+
+**Demo 项目文件清单**
+
+```
+examples/demo_project/
+  calculator.py              # 含故意 bug：return a - b（repair demo 输入）
+  tests/test_calculator.py   # 失败的 pytest（repair demo 输入）
+  pytest.ini                 # pythonpath = . 供 pytest 8+ 使用
+  requirements.md            # spec-review / design-review demo 输入
+  design.md                  # design-review demo 输入
+  sample.diff                # review-diff demo 输入
+```
+
 ---
 
 ## 目录结构
 
 ```
 PatchPilot/
-  agent.py                   # 主入口：repair + spec-review + design-review
+  agent.py                   # 主入口：repair + spec-review + design-review + review-diff
   policies/
     policy.yaml              # 默认 policy 配置（repair 专用）
   llm/
     client.py                # LLMClient + MockLLMClient + create_llm_client()
                              #   generate_patch() → repair 用
-                             #   generate()       → spec-review / design-review 用
+                             #   generate()       → spec-review / design-review / review-diff 用
     prompt_builder.py        # build_repair_prompt()
                              # build_spec_review_prompt()
                              # build_design_review_prompt()
+                             # build_diff_review_prompt()
     parser.py                # extract_diff_from_response()
     fake_llm.py              # 独立工具：从文件读取 patch（未接入主流程）
   tools/
@@ -549,6 +663,7 @@ PatchPilot/
       pytest.ini
       requirements.md        # spec-review / design-review demo 输入
       design.md              # design-review demo 输入
+      sample.diff            # review-diff demo 输入
   scripts/
     reset_demo_project.sh    # 重置 demo_project 到 buggy 初始状态（repair demo 用）
   runs/                      # 每次运行产物（gitignored）
@@ -565,7 +680,7 @@ PatchPilot/
 - **Repair**：`--auto-files` 是规则检索，不是向量检索；对复杂项目未必准确
 - **Repair**：复杂的跨多文件 bug 不保证能成功修复
 - **Repair**：目标目录必须是 git repo（`git apply --check` 依赖）
-- **Spec-review / Design-review**：输出质量依赖 LLM 能力；mock 模式返回固定内容，仅用于演示
+- **Spec-review / Design-review / Review-diff**：输出质量依赖 LLM 能力；mock 模式返回固定内容，仅用于演示
 - 不支持 Web UI，不支持 GitHub PR 自动创建
 - `final_decision` 永远不会自动设为 PASS；所有 AI 输出都需要人工审查
 
@@ -573,4 +688,4 @@ PatchPilot/
 
 ## 关于这个项目
 
-PatchPilot 的核心思路是**将 LLM 嵌入有明确成功/失败判断的工程流程中**，而不是让它自由输出文字。repair workflow 中，LLM 生成 patch，pytest 验证结果，policy guard 守住安全边界，三者形成反馈闭环。spec-review workflow 中，LLM 对需求文档做结构化分析，输出可供工程师直接使用的评审意见。design-review workflow 中，LLM 同时读取需求和设计两份文档，检查设计对需求的覆盖情况，识别风险与遗漏。三个 workflow 都以 `NEEDS_HUMAN_REVIEW` 结束——AI 是助手，最终判断权在人。
+PatchPilot 的核心思路是**将 LLM 嵌入有明确成功/失败判断的工程流程中**，而不是让它自由输出文字。repair workflow 中，LLM 生成 patch，pytest 验证结果，policy guard 守住安全边界，三者形成反馈闭环。spec-review workflow 中，LLM 对需求文档做结构化分析，输出可供工程师直接使用的评审意见。design-review workflow 中，LLM 同时读取需求和设计两份文档，检查设计对需求的覆盖情况，识别风险与遗漏。review-diff workflow 中，LLM 对已有 diff 做代码评审，输出 bug 风险、安全风险、测试缺口和阻塞性问题。四个 workflow 都以 `NEEDS_HUMAN_REVIEW` 结束——AI 是助手，最终判断权在人。
