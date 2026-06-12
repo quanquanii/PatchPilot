@@ -17,7 +17,9 @@ from llm.prompt_builder import build_repair_prompt
 from report.markdown_reporter import write_markdown_report
 from report.reporter import write_report
 from tools.classifier import classify_failure
-from tools.patcher import check_patch, apply_patch
+from tools.patch_guard import run_patch_guard
+from tools.patcher import apply_patch, check_patch
+from tools.policy_loader import load_policy
 from tools.retriever import retrieve_files_from_pytest_log
 from tools.safety import validate_patch, extract_modified_files
 from tools.tester import PytestResult, run_pytest
@@ -25,40 +27,44 @@ from tools.tester import PytestResult, run_pytest
 
 @dataclass
 class Report:
-    """一次修复任务的结构化结果，用于 JSON/Markdown 报告输出。"""
+    """Structured result for one repair run, written to report.json / report.md."""
 
-    success: bool  # 最终是否成功修复（测试通过）
-    baseline_passed: bool # 基线测试是否通过（修复前状态）
-    final_passed: bool # 最终测试结果（修复后状态）
-    iterations: int # 实际执行的修复迭代次数（1 表示仅基线测试，无修复尝试）
-    max_iters: int # 允许的最大修复迭代次数（仅 LLM 模式相关）
-    pytest_cmd: str # 用于测试的 pytest 命令（原样记录以便复现）
-    patch_source: str   # 补丁来源：manual（用户提供）或 llm（模型生成）
-    file_selection_mode: str | None # 相关文件选择模式：manual（用户指定）或 auto（从日志提取），仅 LLM 模式相关
-    selected_files: list[str] | None # 用户选择的相关文件列表（仅 manual 模式相关）
-    modified_files: list[str] | None # 实际修改的文件列表
-    failure_category: str | None # 失败类别
-    baseline_log_path: str # 基线测试日志路径
-    final_log_path: str # 最终测试日志路径
-    warning: str | None # 警告信息（例如基线已通过但仍尝试修复的情况）  
-    history: list[dict] # 每次修复迭代的详细记录，包括选文件、提示词、模型响应、补丁应用、测试结果等
+    success: bool
+    baseline_passed: bool
+    final_passed: bool
+    iterations: int
+    max_iters: int
+    pytest_cmd: str
+    patch_source: str
+    file_selection_mode: str | None
+    selected_files: list[str] | None
+    modified_files: list[str] | None
+    failure_category: str | None
+    baseline_log_path: str
+    final_log_path: str
+    warning: str | None
+    history: list[dict]
+    # policy fields
+    policy_passed: bool
+    policy_result_path: str | None
+    git_apply_check_passed: bool
+    human_review_required: bool
+    final_decision: str          # BLOCKED | NEEDS_HUMAN_REVIEW
+    decision_reasons: list[str]
 
 
 def _compute_warning(baseline_passed: bool) -> str | None:
-    # 基线测试已通过时提醒用户：此次修复可能不是必须的。
     if baseline_passed:
         return "baseline tests already passed; patch may be unnecessary"
     return None
 
 
 def _run_id() -> str:
-    # 使用时间戳作为本次运行目录名，便于追踪和排序。
     return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def _read_repo_files(repo: Path, file_paths: list[str]) -> list[tuple[str, str]]:
-    # 读取候选源码文件，并确保路径不会越过仓库根目录。
-    files: list[tuple[str, str]] = [] 
+    files: list[tuple[str, str]] = []
     for rel_path in file_paths:
         path = (repo / rel_path).resolve()
         if not path.exists():
@@ -69,8 +75,39 @@ def _read_repo_files(repo: Path, file_paths: list[str]) -> list[tuple[str, str]]
     return files
 
 
+def _save_policy_result(run_dir: Path, result: dict, name: str = "policy_result.json") -> Path:
+    p = run_dir / name
+    p.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return p
+
+
+def _build_decision(
+    policy_result: dict,
+    patch_applied: bool,
+    pytest_passed: bool,
+) -> tuple[str, list[str]]:
+    """Return (final_decision, decision_reasons)."""
+    if not policy_result["passed"]:
+        reasons: list[str] = []
+        for c in policy_result["checks"]:
+            if not c["passed"] and c["reason"]:
+                reasons.append(c["reason"])
+        gac = policy_result.get("git_apply_check", {})
+        if gac.get("required") and not gac.get("passed", True):
+            reasons.append(f"git apply --check failed: {gac.get('stderr', '')}")
+        return "BLOCKED", reasons
+
+    reasons = []
+    if not patch_applied:
+        reasons.append("Patch could not be applied")
+    elif not pytest_passed:
+        reasons.append("Tests failed after patch applied")
+    else:
+        reasons.append("AI-generated patch requires human review before merging")
+    return "NEEDS_HUMAN_REVIEW", reasons
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    # 命令行参数定义：支持手动补丁模式与 LLM 修复模式。
     p = argparse.ArgumentParser(description="PatchPilot harness.")
     p.add_argument("--repo", required=True, help="Target repo path")
     p.add_argument(
@@ -107,9 +144,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="runs",
         help="Directory to store run artifacts (default: runs/)",
     )
+    p.add_argument(
+        "--policy",
+        default=None,
+        help="Path to policy YAML file (default: policies/policy.yaml)",
+    )
     args = p.parse_args(argv)
 
-    # 参数组合约束，避免互斥选项或无效配置。
     if bool(args.patch) == bool(args.llm):
         p.error("Exactly one of --patch or --llm is required.")
     if args.patch and args.files:
@@ -136,8 +177,9 @@ def _run_patch_mode(
     run_dir: Path,
     baseline_log_path: Path,
     baseline_result: PytestResult,
+    policy: dict,
 ) -> Report:
-    # 手动补丁模式：读取补丁 -> 校验 -> apply -> pytest 验证。
+    """Manual patch mode: read patch -> policy guard -> apply -> pytest verify."""
     patch_file = Path(args.patch).expanduser().resolve()
     patch_text = patch_file.read_text(encoding="utf-8", errors="replace")
 
@@ -147,24 +189,38 @@ def _run_patch_mode(
     pytest_passed = False
     final_log_path = str(baseline_log_path)
 
-    ok, err = validate_patch(patch_text)
-    if not ok:
-        patch_error = err
+    # Policy guard (includes git apply --check when required)
+    policy_result = run_patch_guard(patch_text, policy, repo_path=repo, patch_file=patch_file)
+    policy_result_path = _save_policy_result(run_dir, policy_result)
+
+    if not policy_result["passed"]:
+        reasons = [c["reason"] for c in policy_result["checks"] if not c["passed"] and c["reason"]]
+        gac = policy_result.get("git_apply_check", {})
+        if gac.get("required") and not gac.get("passed", True) and gac.get("stderr"):
+            reasons.append(f"git apply --check: {gac['stderr']}")
+        patch_error = "Policy check failed: " + "; ".join(reasons)
+    else:
+        # Secondary legacy check (kept per spec — not the sole guard)
+        ok, err = validate_patch(patch_text)
+        if not ok:
+            patch_error = err
 
     if not patch_error:
-        check_res = check_patch(repo, patch_file)
-        if not check_res.ok:
-            patch_error = check_res.error
-        else:
-            apply_res = apply_patch(repo, patch_file)
-            patch_applied = apply_res.ok
-            if not apply_res.ok:
-                patch_error = apply_res.error
+        # If require_git_apply_check=false, guard skipped it — run check_patch as safety net
+        if not policy.get("require_git_apply_check", True):
+            check_res = check_patch(repo, patch_file)
+            if not check_res.ok:
+                patch_error = check_res.error
+
+    if not patch_error:
+        apply_res = apply_patch(repo, patch_file)
+        patch_applied = apply_res.ok
+        if not apply_res.ok:
+            patch_error = apply_res.error
 
     modified_files: list[str] = extract_modified_files(patch_text) if patch_applied else []
 
     if patch_applied:
-        # 仅在补丁成功应用后执行测试。
         iter_result = run_pytest(repo, args.pytest, args.timeout, iter_pytest_log)
         final_log_path = str(iter_pytest_log)
         pytest_passed = iter_result.passed
@@ -175,9 +231,12 @@ def _run_patch_mode(
 
     failure_category: str | None = None
     if not success:
-        # 优先使用补丁错误，否则根据 pytest 日志进行失败分类。
         fail_text = patch_error or iter_pytest_log.read_text(encoding="utf-8")
         failure_category = classify_failure(fail_text)
+
+    final_decision, decision_reasons = _build_decision(policy_result, patch_applied, pytest_passed)
+    gac = policy_result.get("git_apply_check", {})
+    git_apply_check_passed = gac.get("passed", True) if gac.get("required") else True
 
     history = [
         {
@@ -192,6 +251,7 @@ def _run_patch_mode(
             "llm_error": None,
             "patch_error": patch_error,
             "failure_category": failure_category,
+            "policy_result_path": str(policy_result_path),
         }
     ]
 
@@ -211,6 +271,12 @@ def _run_patch_mode(
         final_log_path=final_log_path,
         warning=_compute_warning(baseline_result.passed),
         history=history,
+        policy_passed=policy_result["passed"],
+        policy_result_path=str(policy_result_path),
+        git_apply_check_passed=git_apply_check_passed,
+        human_review_required=(final_decision != "BLOCKED"),
+        final_decision=final_decision,
+        decision_reasons=decision_reasons,
     )
 
 
@@ -220,8 +286,9 @@ def _run_llm_repair_loop(
     run_dir: Path,
     baseline_log_path: Path,
     baseline_result: PytestResult,
+    policy: dict,
 ) -> Report:
-    # LLM 迭代修复模式：选文件 -> 组 prompt -> 生成补丁 -> 校验/apply -> pytest。
+    """LLM iterative repair: select files -> prompt -> generate patch -> guard -> apply -> pytest."""
     file_selection_mode = "manual" if args.files else "auto"
 
     current_feedback = baseline_log_path.read_text(encoding="utf-8")
@@ -235,14 +302,16 @@ def _run_llm_repair_loop(
     all_modified_files: list[str] = []
     all_modified_seen: set[str] = set()
 
+    last_policy_result: dict = {"passed": True, "checks": [], "git_apply_check": {"required": False, "passed": True, "stderr": ""}}
+    last_policy_result_path: Path | None = None
+
     for iter_n in range(1, args.max_iters + 1):
-        # Paths for this iteration's artifacts
         prompt_path = run_dir / f"repair_prompt_iter_{iter_n}.txt"
         llm_response_path = run_dir / f"llm_response_iter_{iter_n}.txt"
         generated_patch_path = run_dir / f"generated_patch_iter_{iter_n}.diff"
         iter_pytest_log = run_dir / f"pytest_iter_{iter_n}.log"
+        iter_policy_result_path = run_dir / f"policy_result_iter_{iter_n}.json"
 
-        # Per-iteration state
         llm_error: str | None = None
         patch_error: str | None = None
         patch_applied = False
@@ -252,21 +321,17 @@ def _run_llm_repair_loop(
         llm_response_path_str: str | None = None
         generated_patch_path_str: str | None = None
         retrieved_files_path_str: str | None = None
+        iter_policy_result: dict | None = None
 
         # ── a. Select files ──────────────────────────────────────────────────
         if args.files:
             file_paths = list(args.files)
         else:
-            # 自动模式下从当前失败日志提取最相关文件，并落盘留痕。
             retrieved = retrieve_files_from_pytest_log(repo, current_feedback)
             rf_json = run_dir / f"retrieved_files_iter_{iter_n}.json"
             rf_json.write_text(
                 json.dumps(
-                    {
-                        "iteration": iter_n,
-                        "mode": "auto",
-                        "files": [str(p) for p in retrieved],
-                    },
+                    {"iteration": iter_n, "mode": "auto", "files": [str(p) for p in retrieved]},
                     ensure_ascii=False,
                     indent=2,
                 )
@@ -283,7 +348,6 @@ def _run_llm_repair_loop(
         else:
             # ── b–d. Prompt → LLM → parse patch ─────────────────────────────
             try:
-                # 将失败上下文与候选源码拼装成修复提示词。
                 file_contents = _read_repo_files(repo, file_paths)
                 prompt = build_repair_prompt(
                     current_feedback,
@@ -299,7 +363,6 @@ def _run_llm_repair_loop(
                 llm_response_path.write_text(response, encoding="utf-8")
                 llm_response_path_str = str(llm_response_path)
 
-                # 从模型响应中抽取 unified diff 补丁文本。
                 patch_text = extract_diff_from_response(response)
                 generated_patch_path.write_text(patch_text, encoding="utf-8")
                 generated_patch_path_str = str(generated_patch_path)
@@ -312,29 +375,45 @@ def _run_llm_repair_loop(
             except Exception as e:
                 llm_error = f"{type(e).__name__}: {e}"
 
-        # ── e. Safety validation ──────────────────────────────────────────────
+        # ── e. Policy guard ───────────────────────────────────────────────────
         if patch_text and not llm_error:
-            # 安全检查阶段拒绝危险或不合法补丁。
-            ok, err = validate_patch(patch_text)
-            if not ok:
-                patch_error = err
+            iter_policy_result = run_patch_guard(
+                patch_text, policy, repo_path=repo, patch_file=generated_patch_path
+            )
+            _save_policy_result(run_dir, iter_policy_result, iter_policy_result_path.name)
+            last_policy_result = iter_policy_result
+            last_policy_result_path = iter_policy_result_path
+
+            if not iter_policy_result["passed"]:
+                reasons = [c["reason"] for c in iter_policy_result["checks"] if not c["passed"] and c["reason"]]
+                gac = iter_policy_result.get("git_apply_check", {})
+                if gac.get("required") and not gac.get("passed", True) and gac.get("stderr"):
+                    reasons.append(f"git apply --check: {gac['stderr']}")
+                patch_error = "Policy check failed: " + "; ".join(reasons)
+            else:
+                # Secondary legacy check
+                ok, err = validate_patch(patch_text)
+                if not ok:
+                    patch_error = err
 
         # ── f. git apply ──────────────────────────────────────────────────────
         if patch_text and not llm_error and not patch_error:
-            check_res = check_patch(repo, generated_patch_path)
-            if not check_res.ok:
-                patch_error = check_res.error
+            # If require_git_apply_check=false, guard skipped it — run check_patch as safety net
+            if not policy.get("require_git_apply_check", True):
+                check_res = check_patch(repo, generated_patch_path)
+                if not check_res.ok:
+                    patch_error = check_res.error
+
+        if patch_text and not llm_error and not patch_error:
+            apply_res = apply_patch(repo, generated_patch_path)
+            patch_applied = apply_res.ok
+            if not apply_res.ok:
+                patch_error = apply_res.error
             else:
-                apply_res = apply_patch(repo, generated_patch_path)
-                patch_applied = apply_res.ok
-                if not apply_res.ok:
-                    patch_error = apply_res.error
-                else:
-                    # 汇总本次运行中所有被修改的文件（去重后保序）。
-                    for mf in extract_modified_files(patch_text):
-                        if mf not in all_modified_seen:
-                            all_modified_files.append(mf)
-                            all_modified_seen.add(mf)
+                for mf in extract_modified_files(patch_text):
+                    if mf not in all_modified_seen:
+                        all_modified_files.append(mf)
+                        all_modified_seen.add(mf)
 
         # ── g. Run pytest ─────────────────────────────────────────────────────
         if patch_applied:
@@ -342,14 +421,11 @@ def _run_llm_repair_loop(
             final_log_path = str(iter_pytest_log)
             pytest_passed = iter_result.passed
         else:
-            iter_pytest_log.write_text(
-                "Patch not applied; pytest skipped.\n", encoding="utf-8"
-            )
+            iter_pytest_log.write_text("Patch not applied; pytest skipped.\n", encoding="utf-8")
 
         # ── Classify failure ──────────────────────────────────────────────────
         failure_category: str | None = None
         if not pytest_passed or patch_error or llm_error:
-            # 分类优先级：LLM 错误 > 补丁错误 > pytest 日志。
             if llm_error:
                 fail_text = llm_error
             elif patch_error:
@@ -372,6 +448,7 @@ def _run_llm_repair_loop(
             "llm_error": llm_error,
             "patch_error": patch_error,
             "failure_category": failure_category,
+            "policy_result_path": str(iter_policy_result_path) if iter_policy_result else None,
         }
         if retrieved_files_path_str:
             entry["retrieved_files_path"] = retrieved_files_path_str
@@ -379,24 +456,29 @@ def _run_llm_repair_loop(
 
         # ── h/i. Stop or update feedback ─────────────────────────────────────
         if pytest_passed:
-            # 一旦通过立即结束迭代。
             final_passed = True
             success = True
             break
 
         if patch_applied:
-            # 补丁已应用但测试未通过：用新日志继续驱动下一轮修复。
             current_feedback = iter_pytest_log.read_text(encoding="utf-8")
             previous_error = None
         else:
-            # 补丁未应用：记录错误作为下一轮提示。
             previous_error = patch_error or llm_error or "Unknown error"
             if not file_paths:
-                break  # retriever won't improve without new feedback
+                break
 
     top_failure: str | None = None
     if not success and history:
         top_failure = history[-1].get("failure_category")
+
+    final_decision, decision_reasons = _build_decision(
+        last_policy_result,
+        patch_applied=(history[-1]["patch_applied"] if history else False),
+        pytest_passed=final_passed,
+    )
+    gac = last_policy_result.get("git_apply_check", {})
+    git_apply_check_passed = gac.get("passed", True) if gac.get("required") else True
 
     return Report(
         success=success,
@@ -414,11 +496,16 @@ def _run_llm_repair_loop(
         final_log_path=final_log_path,
         warning=_compute_warning(baseline_result.passed),
         history=history,
+        policy_passed=last_policy_result["passed"],
+        policy_result_path=str(last_policy_result_path) if last_policy_result_path else None,
+        git_apply_check_passed=git_apply_check_passed,
+        human_review_required=(final_decision != "BLOCKED"),
+        final_decision=final_decision,
+        decision_reasons=decision_reasons,
     )
 
 
 def main(argv: list[str]) -> int:
-    # 主流程：解析参数 -> 跑基线测试 -> 执行对应修复模式 -> 写报告。
     args = parse_args(argv)
 
     repo = Path(args.repo).expanduser().resolve()
@@ -431,6 +518,8 @@ def main(argv: list[str]) -> int:
     report_path = run_dir / "report.json"
     report_md_path = run_dir / "report.md"
 
+    policy = load_policy(args.policy)
+
     baseline_result = run_pytest(
         repo_path=repo,
         pytest_cmd=args.pytest,
@@ -439,15 +528,14 @@ def main(argv: list[str]) -> int:
     )
 
     if args.patch:
-        report = _run_patch_mode(args, repo, run_dir, baseline_log_path, baseline_result)
+        report = _run_patch_mode(args, repo, run_dir, baseline_log_path, baseline_result, policy)
     else:
-        report = _run_llm_repair_loop(args, repo, run_dir, baseline_log_path, baseline_result)
+        report = _run_llm_repair_loop(args, repo, run_dir, baseline_log_path, baseline_result, policy)
 
     report_dict = asdict(report)
     write_report(report_path, report_dict)
     write_markdown_report(report_md_path, report_dict)
 
-    # 标准输出仅打印报告路径，便于外部脚本消费。
     sys.stdout.write(
         json.dumps({"report": str(report_path), "report_md": str(report_md_path)}, ensure_ascii=False)
         + "\n"

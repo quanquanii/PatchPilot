@@ -1,0 +1,20 @@
+allowed_file_extensions:
+  - ".py"
+  - ".md"
+
+blocked_paths:
+  - ".env"
+  - "id_rsa"
+  - "secret"
+  - "token"
+  - "credentials"
+
+protected_paths:
+  - "policies/"
+  - ".github/workflows/"
+
+max_changed_files: 3
+max_patch_lines: 120
+allow_test_modification: false
+require_tests: true
+require_git_apply_check: true

@@ -12,6 +12,8 @@ def _render(r: dict) -> str:
 
     lines.append("# PatchPilot Report\n")
     lines.append(f"**Result:** {'Success' if r.get('success') else 'Failure'}")
+    lines.append(f"**Final decision:** `{r.get('final_decision', 'n/a')}`")
+    lines.append(f"**Human review required:** {'Yes' if r.get('human_review_required') else 'No'}")
     lines.append(f"**Test command:** `{r.get('pytest_cmd', '')}`")
     lines.append(f"**Patch source:** {r.get('patch_source', 'n/a')}")
     lines.append(f"**Iterations:** {r.get('iterations', 0)} / {r.get('max_iters', 1)}")
@@ -25,6 +27,20 @@ def _render(r: dict) -> str:
 
     lines.append(f"**Failure category:** {r.get('failure_category') or '-'}")
     lines.append(f"**Warning:** {r.get('warning') or '-'}")
+
+    lines.append("\n## Policy Guard\n")
+    lines.append(f"**Policy passed:** {'Yes' if r.get('policy_passed') else 'No'}")
+    lines.append(f"**git apply --check passed:** {'Yes' if r.get('git_apply_check_passed') else 'No'}")
+
+    reasons = r.get("decision_reasons") or []
+    if reasons:
+        lines.append(f"**Decision reasons:**")
+        for reason in reasons:
+            lines.append(f"  - {reason}")
+
+    policy_path = r.get("policy_result_path")
+    if policy_path:
+        lines.append(f"**Policy result:** `{policy_path}`")
 
     lines.append("\n## Log paths\n")
     lines.append(f"- Baseline log: `{r.get('baseline_log_path', '')}`")
@@ -48,6 +64,7 @@ def _render(r: dict) -> str:
                 ("Generated patch", "generated_patch_path"),
                 ("Pytest log", "pytest_log_path"),
                 ("Retrieved files", "retrieved_files_path"),
+                ("Policy result", "policy_result_path"),
             ):
                 val = rec.get(key)
                 lines.append(f"| {label} | {f'`{val}`' if val else '-'} |")
