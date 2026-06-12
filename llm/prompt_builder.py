@@ -32,6 +32,41 @@ Return ONLY a JSON object wrapped in a ```json code block with exactly these fie
 """
 
 
+def build_design_review_prompt(requirements_text: str, design_text: str) -> str:
+    """Build a prompt that asks the LLM to review a design document against requirements."""
+    return f"""## DESIGN-REVIEW
+
+You are a senior software engineer reviewing a design document against its requirements.
+Analyse both documents and return your review as a single JSON object.
+
+## Requirements Document
+
+{requirements_text.strip()}
+
+## Design Document
+
+{design_text.strip()}
+
+## Output Format
+
+Return ONLY a JSON object wrapped in a ```json code block with exactly these fields:
+
+```json
+{{
+  "requirement_coverage": ["requirement 1 is covered by ...", "requirement 2 is covered by ..."],
+  "missing_requirements": ["requirement not addressed in design"],
+  "design_risks": ["risk 1", "risk 2"],
+  "edge_cases": ["edge case 1", "edge case 2"],
+  "security_risks": ["security concern 1"],
+  "test_strategy": ["test approach 1", "test approach 2"],
+  "interfaces_and_boundaries": ["boundary observation 1"],
+  "human_review_required": true,
+  "final_decision": "NEEDS_HUMAN_REVIEW"
+}}
+```
+"""
+
+
 def _guess_lang(rel_path: str) -> str:
     if rel_path.endswith(".py"):
         return "python"

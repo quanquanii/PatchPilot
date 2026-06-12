@@ -134,7 +134,53 @@ class MockLLMClient:
         ```
         """)
 
+    _DESIGN_REVIEW_RESPONSE = textwrap.dedent("""\
+        ```json
+        {
+          "requirement_coverage": [
+            "add(a, b) returns the sum — directly implemented as 'return a + b'",
+            "Integer support — covered by the implementation and existing test",
+            "Float support — implementation supports floats; tests do not yet cover this"
+          ],
+          "missing_requirements": [
+            "Behavior for non-number inputs is unspecified in both requirements and design",
+            "No precision or overflow requirements addressed in the design"
+          ],
+          "design_risks": [
+            "No input validation means silent wrong results for non-numeric inputs",
+            "Module boundary is unclear; no plan for growth beyond add()",
+            "Single flat file will become hard to maintain if more operations are added"
+          ],
+          "edge_cases": [
+            "add(None, 1) — will raise TypeError at runtime, not caught",
+            "add('2', 3) — will raise TypeError, behavior undocumented",
+            "add(1e308, 1e308) — float overflow to inf, no guard"
+          ],
+          "security_risks": [
+            "No input validation; malicious or unexpected inputs propagate unchecked",
+            "If exposed via an API layer, lack of type enforcement is a surface risk"
+          ],
+          "test_strategy": [
+            "Add float test: add(1.5, 2.5) == 4.0",
+            "Add zero test: add(0, 0) == 0",
+            "Add negative test: add(-1, 1) == 0",
+            "Consider parametrize for integer and float cases",
+            "Add a test that documents expected behavior for non-numeric inputs"
+          ],
+          "interfaces_and_boundaries": [
+            "Currently a flat module; consider a calculator/ package if operations grow",
+            "No public API contract (docstring, type hints) defined on add()",
+            "Type hints would make the intended interface explicit"
+          ],
+          "human_review_required": true,
+          "final_decision": "NEEDS_HUMAN_REVIEW"
+        }
+        ```
+        """)
+
     def generate(self, prompt: str) -> str:
+        if "DESIGN-REVIEW" in prompt:
+            return self._DESIGN_REVIEW_RESPONSE
         if "SPEC-REVIEW" in prompt:
             return self._SPEC_REVIEW_RESPONSE
         return self._PATCH_RESPONSE

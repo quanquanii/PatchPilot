@@ -13,7 +13,7 @@ load_dotenv()
 
 from llm.client import LLMClient, create_llm_client
 from llm.parser import extract_diff_from_response
-from llm.prompt_builder import build_repair_prompt, build_spec_review_prompt
+from llm.prompt_builder import build_repair_prompt, build_spec_review_prompt, build_design_review_prompt
 from report.markdown_reporter import write_markdown_report
 from report.reporter import write_report
 from tools.classifier import classify_failure
@@ -110,9 +110,11 @@ def _build_decision(
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PatchPilot harness.")
 
-    # ── spec-review mode ──────────────────────────────────────────────────────
+    # ── review modes ──────────────────────────────────────────────────────────
     p.add_argument("--spec-review", action="store_true", help="Run spec review workflow")
-    p.add_argument("--requirements", help="Path to requirements.md (--spec-review mode)")
+    p.add_argument("--design-review", action="store_true", help="Run design review workflow")
+    p.add_argument("--requirements", help="Path to requirements.md (--spec-review / --design-review)")
+    p.add_argument("--design", help="Path to design.md (--design-review mode)")
 
     # ── repair mode ───────────────────────────────────────────────────────────
     p.add_argument("--repo", help="Target repo path (repair mode)")
@@ -165,17 +167,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
     args = p.parse_args(argv)
 
-    # ── spec-review validation ────────────────────────────────────────────────
+    # ── review mode validation ────────────────────────────────────────────────
+    if args.spec_review and args.design_review:
+        p.error("--spec-review and --design-review cannot be used together.")
     if args.spec_review:
         if not args.requirements:
             p.error("--spec-review requires --requirements")
         return args
+    if args.design_review:
+        if not args.requirements:
+            p.error("--design-review requires --requirements")
+        if not args.design:
+            p.error("--design-review requires --design")
+        return args
 
     # ── repair mode validation ────────────────────────────────────────────────
     if not args.repo:
-        p.error("--repo is required in repair mode (or use --spec-review)")
+        p.error("--repo is required in repair mode (or use --spec-review / --design-review)")
     if not args.pytest:
-        p.error("--pytest is required in repair mode (or use --spec-review)")
+        p.error("--pytest is required in repair mode (or use --spec-review / --design-review)")
     if bool(args.patch) == bool(args.llm):
         p.error("Exactly one of --patch or --llm is required.")
     if args.patch and args.files:
@@ -649,6 +659,92 @@ def _run_spec_review(args: argparse.Namespace, run_dir: Path) -> int:
     return 0
 
 
+def _write_design_review_md(path: Path, report: dict) -> None:
+    lines: list[str] = []
+    lines.append("# PatchPilot Design Review\n")
+    lines.append(f"**Requirements:** `{report.get('requirements_path', '')}`")
+    lines.append(f"**Design:** `{report.get('design_path', '')}`")
+    lines.append(f"**Final decision:** `{report.get('final_decision', 'n/a')}`")
+    lines.append(f"**Human review required:** {'Yes' if report.get('human_review_required') else 'No'}")
+    if report.get("llm_error"):
+        lines.append(f"\n**LLM error:** {report['llm_error']}")
+    if report.get("parse_error"):
+        lines.append(f"\n**Parse error:** {report['parse_error']}")
+    _list_section(lines, "Requirement Coverage", report.get("requirement_coverage"))
+    _list_section(lines, "Missing Requirements", report.get("missing_requirements"))
+    _list_section(lines, "Design Risks", report.get("design_risks"))
+    _list_section(lines, "Edge Cases", report.get("edge_cases"))
+    _list_section(lines, "Security Risks", report.get("security_risks"))
+    _list_section(lines, "Test Strategy", report.get("test_strategy"))
+    _list_section(lines, "Interfaces and Boundaries", report.get("interfaces_and_boundaries"))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _run_design_review(args: argparse.Namespace, run_dir: Path) -> int:
+    """Design-review workflow: read requirements + design -> LLM -> JSON report."""
+    req_path = Path(args.requirements).expanduser().resolve()
+    design_path = Path(args.design).expanduser().resolve()
+
+    for label, p in (("Requirements", req_path), ("Design", design_path)):
+        if not p.exists():
+            sys.stderr.write(f"{label} file not found: {p}\n")
+            return 1
+
+    req_text = req_path.read_text(encoding="utf-8")
+    design_text = design_path.read_text(encoding="utf-8")
+
+    (run_dir / "input_requirements.md").write_text(req_text, encoding="utf-8")
+    (run_dir / "input_design.md").write_text(design_text, encoding="utf-8")
+
+    prompt = build_design_review_prompt(req_text, design_text)
+    (run_dir / "design_review_prompt.md").write_text(prompt, encoding="utf-8")
+
+    llm_error: str | None = None
+    response: str = ""
+    try:
+        client = create_llm_client(args.llm_mode)
+        response = client.generate(prompt)
+        (run_dir / "llm_response.txt").write_text(response, encoding="utf-8")
+    except Exception as e:
+        llm_error = f"{type(e).__name__}: {e}"
+
+    result: dict = {}
+    parse_error: str | None = None
+    if not llm_error:
+        result, parse_error = _parse_spec_review_response(response)
+
+    report: dict = {
+        "mode": "design-review",
+        "requirements_path": str(req_path),
+        "design_path": str(design_path),
+        "final_decision": result.get("final_decision", "NEEDS_HUMAN_REVIEW"),
+        "human_review_required": result.get("human_review_required", True),
+        "requirement_coverage": result.get("requirement_coverage", []),
+        "missing_requirements": result.get("missing_requirements", []),
+        "design_risks": result.get("design_risks", []),
+        "edge_cases": result.get("edge_cases", []),
+        "security_risks": result.get("security_risks", []),
+        "test_strategy": result.get("test_strategy", []),
+        "interfaces_and_boundaries": result.get("interfaces_and_boundaries", []),
+    }
+    if llm_error:
+        report["llm_error"] = llm_error
+    if parse_error:
+        report["parse_error"] = parse_error
+        report["raw_response"] = response
+
+    report_path = run_dir / "report.json"
+    report_md_path = run_dir / "report.md"
+    write_report(report_path, report)
+    _write_design_review_md(report_md_path, report)
+
+    sys.stdout.write(
+        json.dumps({"report": str(report_path), "report_md": str(report_md_path)}, ensure_ascii=False)
+        + "\n"
+    )
+    return 0
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
 
@@ -658,6 +754,9 @@ def main(argv: list[str]) -> int:
 
     if args.spec_review:
         return _run_spec_review(args, run_dir)
+
+    if args.design_review:
+        return _run_design_review(args, run_dir)
 
     # ── repair mode ───────────────────────────────────────────────────────────
     repo = Path(args.repo).expanduser().resolve()
